@@ -112,8 +112,8 @@ def main():
     parser = argparse.ArgumentParser("MLP classifier")
     parser.add_argument("--data", required=True)
     parser.add_argument("--label_name", default="label")
-    parser.add_argument("--sex_name", default="sex")      ### NEW
-    parser.add_argument("--age_name", default="age")      ### NEW
+    parser.add_argument("--sex_name", default="sex")
+    parser.add_argument("--age_name", default="age")
     parser.add_argument("--test_size", type=float, default=0.2)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=20)
@@ -127,12 +127,12 @@ def main():
     args = parser.parse_args()
 
     # 1. Load data
-    rng = np.random.RandomState(args.seed)                 ### NEW (shared RNG)
+    rng = np.random.RandomState(args.seed)
     df = pd.read_csv(args.data)
 
-    # 2. Remember where the two columns of interest are *before* we convert to ndarray
-    sex_idx = df.columns.get_loc(args.sex_name)            ### NEW
-    age_idx = df.columns.get_loc(args.age_name)            ### NEW
+    # 2.The two columns of interest
+    sex_idx = df.columns.get_loc(args.sex_name)
+    age_idx = df.columns.get_loc(args.age_name)
 
     y = df.pop(args.label_name).to_numpy()
     X = df.to_numpy(dtype=np.float32)
@@ -146,16 +146,17 @@ def main():
     class_w = torch.as_tensor(class_w, dtype=torch.float32, device=args.device)
 
     # 4. Create permuted-column copy of the test features
-    X_te_perm = X_te.copy()                                ### NEW
-    for col in (sex_idx, age_idx):                         ### NEW
+    # TODO(yixiao): can try different masking methods.
+    X_te_perm = X_te.copy()
+    for col in (sex_idx, age_idx):
         X_te_perm[:, col] = rng.permutation(X_te_perm[:, col])
 
     # 5. DataLoaders
     tr_loader = make_loader(X_tr, y_tr, args.batch_size, True)
     te_loader = make_loader(X_te, y_te, args.batch_size, False)
-    perm_loader = make_loader(X_te_perm, y_te, args.batch_size, False)   ### NEW
+    perm_loader = make_loader(X_te_perm, y_te, args.batch_size, False)
 
-    # 6. Model / loss / optimiser
+    # 6. Model / loss / optimizer / scheduler
     model = ResMLP(X.shape[1], args.hidden_dims, len(np.unique(y)), args.dropout).to(args.device)
     criterion = nn.CrossEntropyLoss(weight=class_w)
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -185,7 +186,7 @@ def main():
 
     with open(args.output_file_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["original", "masked"])  # optional header
+        writer.writerow(["original", "masked"])
         for col1, col2 in zip(logits1, logits2):
             writer.writerow([col1, col2])
 
