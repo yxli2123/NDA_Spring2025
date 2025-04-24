@@ -1,0 +1,11 @@
+python mlp_dropout.py \
+  --data  ../heart_failure_clinical_records_dataset.csv \
+  --label_name DEATH_EVENT \
+  --test_size 0.1 \
+  --batch_size 32 \
+  --epochs 50 \
+  --lr 0.1 \
+  --hidden_dims 16 16 16 \
+  --dropout 0.4 \
+  --device mps \
+  --seed 45
