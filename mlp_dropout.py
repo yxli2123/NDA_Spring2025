@@ -94,17 +94,22 @@ def train_epoch(model: nn.Module, loader: DataLoader, criterion, optim, device) 
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device) -> (List, float):
-    logits, preds, gts = [], [], []
-    for _ in range(5):
+def evaluate(model: nn.Module, loader: DataLoader, device, repeats=3) -> (List, float):
+    repeated_logits, preds, gts = [], [], []
+    for _ in range(repeats):
+        logits = []
         for xb, yb in loader:
             logit = model(xb.to(device)).cpu()
             logits.append(logit)
             predicts = logit.argmax(dim=-1)
             preds.append(predicts)
             gts.append(yb)
-    logits = torch.cat(logits)
-    logits = torch.softmax(logits, dim=-1)[:, 1]
+        logits = torch.cat(logits)
+        repeated_logits.append(logits)
+    repeated_logits = torch.stack(repeated_logits)
+    logits = torch.softmax(repeated_logits, dim=-1)[..., 1]
+
+    # logits shape: (repeats, test_size)
     return logits, accuracy_score(torch.cat(gts), torch.cat(preds))
 
 
@@ -123,6 +128,7 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_file_path", type=str, default="prob_output.csv")
+    parser.add_argument("--repeats", type=int, default=10, help="Number of times to run the model")
 
     args = parser.parse_args()
 
@@ -176,19 +182,23 @@ def main():
               f"| test acc: {acc_orig:.4f} | best: {best_acc:.4f}")
 
     # 8. Final evaluation on both test variants
-    logits1, acc_orig = evaluate(model, te_loader, args.device)
-    logits2, acc_perm = evaluate(model, perm_loader, args.device)
+    logits1, acc_orig = evaluate(model, te_loader, args.device, repeats=args.repeats)
+    logits2, acc_perm = evaluate(model, perm_loader, args.device, repeats=args.repeats)
     print(f"\nFinal accuracy — original test set:  {acc_orig:.4f}")
     print(f"Final accuracy — permuted sex/age set: {acc_perm:.4f}")
 
-    logits1 = logits1.numpy().tolist()
-    logits2 = logits2.numpy().tolist()
+    num_repeats, num_records = logits1.shape
+    record_ids = torch.arange(1, num_records + 1).repeat_interleave(num_repeats)
 
-    with open(args.output_file_path, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["original", "masked"])
-        for col1, col2 in zip(logits1, logits2):
-            writer.writerow([col1, col2])
+    score1_flat = logits1.T.contiguous().view(-1)
+    score2_flat = logits2.T.contiguous().view(-1)
+
+    df = pd.DataFrame({
+        'record_id': record_ids.numpy(),
+        'prob_original': score1_flat.numpy(),
+        'prob_masked': score2_flat.numpy()
+    })
+    df.to_csv('prob_output.csv', index=False)
 
 
 if __name__ == "__main__":

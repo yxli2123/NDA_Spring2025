@@ -8,4 +8,5 @@ python mlp_dropout.py \
   --hidden_dims 16 16 16 \
   --dropout 0.4 \
   --device mps \
-  --seed 45
+  --seed 43 \
+  --repeats 100 \
