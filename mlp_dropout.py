@@ -16,6 +16,7 @@ python mlp_dropout.py \
 """
 import argparse
 import csv
+import random
 from typing import List
 
 import numpy as np
@@ -25,6 +26,7 @@ from sklearn.metrics import accuracy_score
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
 
@@ -32,27 +34,25 @@ class MLP(nn.Module):
     def __init__(
             self,
             input_dim: int,
-            hidden_dim: int,
             output_dim: int,
             dropout: float,
+            dropout_infer: float,
             *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
-        self.norm = nn.LayerNorm(input_dim)
-        self.proj_up = nn.Linear(input_dim, hidden_dim, bias=True)
-        self.proj_gate = nn.Linear(input_dim, hidden_dim, bias=True)
-        self.proj_down = nn.Linear(hidden_dim, output_dim, bias=True)
+        self.linear = nn.Linear(input_dim, output_dim, bias=True)
+        self.p_train = dropout
+        self.p_infer = dropout_infer
         self.dropout = nn.Dropout(dropout)
-        self.activation = nn.SiLU()
+        self.activation = nn.ReLU()
 
     def forward(self, x):
-        x = self.norm(x)
-        skip = x.clone()
-        x = self.proj_up(x) * self.proj_gate(x)
+        rate = self.p_train if self.training else self.p_infer
+        x = F.dropout(x, p=rate, training=True)
+        x = self.linear(x)
         x = self.activation(x)
-        x = self.dropout(x)
-        y = self.proj_down(x)
-        return skip + y
+        y = self.dropout(x)
+        return y
 
 
 class ResMLP(nn.Module):
@@ -62,17 +62,27 @@ class ResMLP(nn.Module):
             hidden_dims: List[int] | None = None,
             num_classes: int = 2,
             dropout: float = 0.1,
+            dropout_infer: float = 0.1,
     ):
         super().__init__()
         hidden_dims = hidden_dims or [16, 16]
-        layers = [nn.LayerNorm(input_dim), nn.Linear(input_dim, hidden_dims[0])]
+        layers = [nn.LayerNorm(input_dim), nn.Linear(input_dim, hidden_dims[0]), nn.ReLU()]
         for in_dim, out_dim in zip(hidden_dims[:-1], hidden_dims[1:]):
-            layers.append(MLP(in_dim, 4 * in_dim, out_dim, dropout=dropout))
+            layers.append(MLP(in_dim, out_dim, dropout=dropout, dropout_infer=dropout_infer))
         layers.append(nn.Linear(hidden_dims[-1], num_classes))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
+
+
+def set_seed(seed: int):
+    # 1. Python built‐in random
+    random.seed(seed)
+    # 2. NumPy
+    np.random.seed(seed)
+    # 3. Torch (CPU)
+    torch.manual_seed(seed)
 
 
 def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:
@@ -91,6 +101,18 @@ def train_epoch(model: nn.Module, loader: DataLoader, criterion, optim, device) 
         optim.step()
         running += loss.item() * xb.size(0)
     return running / len(loader.dataset)
+
+
+def set_inference_dropout(model: nn.Module, new_dropout_rate: float):
+    """
+    Walks the model and for every nn.Dropout:
+     • sets its drop‐probability to p
+     • turns it into train‐mode so it actually drops
+    """
+    for m in model.modules():
+        if isinstance(m, nn.Dropout):
+            m.p = new_dropout_rate
+            m.train()
 
 
 @torch.no_grad()
@@ -125,12 +147,15 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_dims", type=int, nargs="+", default=[128, 64])
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--eval_dropout_original", type=float, default=0.2)
+    parser.add_argument("--eval_dropout_masked", type=float, default=0.5)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_file_path", type=str, default="prob_output.csv")
     parser.add_argument("--repeats", type=int, default=10, help="Number of times to run the model")
 
     args = parser.parse_args()
+    set_seed(args.seed)
 
     # 1. Load data
     rng = np.random.RandomState(args.seed)
@@ -163,8 +188,8 @@ def main():
     perm_loader = make_loader(X_te_perm, y_te, args.batch_size, False)
 
     # 6. Model / loss / optimizer / scheduler
-    model = ResMLP(X.shape[1], args.hidden_dims, len(np.unique(y)), args.dropout).to(args.device)
-    criterion = nn.CrossEntropyLoss(weight=class_w)
+    model = ResMLP(X.shape[1], args.hidden_dims, len(np.unique(y)), args.dropout, args.eval_dropout_original).to(args.device)
+    criterion = nn.CrossEntropyLoss()
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     t_max = args.epochs  # default period = total epochs
@@ -172,18 +197,32 @@ def main():
 
     # 7. Training loop
     best_acc = 0.0
+    best_ckpt = "best_model.pt"
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_epoch(model, tr_loader, criterion, optim, args.device)
         _, acc_orig = evaluate(model, te_loader, args.device)
-        best_acc = max(best_acc, acc_orig)
+        # if this epoch is the new best, save a checkpoint
+        if acc_orig > best_acc:
+            best_acc = acc_orig
+            torch.save(model.state_dict(), best_ckpt)
         scheduler.step()
         lr_now = optim.param_groups[0]['lr']
         print(f"Epoch {epoch:03d} | lr: {lr_now:.2e} | loss: {tr_loss:.4f} "
               f"| test acc: {acc_orig:.4f} | best: {best_acc:.4f}")
 
     # 8. Final evaluation on both test variants
-    logits1, acc_orig = evaluate(model, te_loader, args.device, repeats=args.repeats)
-    logits2, acc_perm = evaluate(model, perm_loader, args.device, repeats=args.repeats)
+    model1 = ResMLP(X.shape[1], args.hidden_dims, len(np.unique(y)), args.dropout, args.eval_dropout_original).to(args.device)
+    model2 = ResMLP(X.shape[1], args.hidden_dims, len(np.unique(y)), args.dropout, args.eval_dropout_masked).to(args.device)
+
+    model1.load_state_dict(torch.load(best_ckpt, map_location=args.device))
+    model1.to(args.device)
+    model1.eval()
+    model2.load_state_dict(torch.load(best_ckpt, map_location=args.device))
+    model2.to(args.device)
+    model2.eval()
+
+    logits1, acc_orig = evaluate(model1, te_loader, args.device, repeats=args.repeats)
+    logits2, acc_perm = evaluate(model2, perm_loader, args.device, repeats=args.repeats)
     print(f"\nFinal accuracy — original test set:  {acc_orig:.4f}")
     print(f"Final accuracy — permuted sex/age set: {acc_perm:.4f}")
 
